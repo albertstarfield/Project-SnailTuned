@@ -3,3 +3,4 @@ huggingface_hub
 gguf
 llama-cpp-python
 transformers
+sentencepiece

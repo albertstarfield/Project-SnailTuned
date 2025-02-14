@@ -4,17 +4,20 @@ import torch
 import numpy as np
 from safetensors.torch import save_file
 from gguf import dequantize
-from typing import Dict
+from typing import Dict, Optional
 from transformers import AutoConfig, PretrainedConfig
 import logging
 from typing import BinaryIO, List, Any, Tuple
 import json
+import sentencepiece as spm
+import tempfile  # Import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # --- Constants ---
 GGUF_MAGIC = b"GGUF"
+TEMP_DIR = "./tensormemtmpswap"  # Temporary directory for tensor data
 
 # Define the metadata value types
 class GGUFValueType:
@@ -178,8 +181,135 @@ def print_metadata_table(metadata: Dict[str, Any]) -> None:
         print(f"{key:<40} | {value_type_name:<15} | {formatted_value:<25}")
     print("-" * 80)
 
+def create_tokenizer_model_from_json(
+    tokenizer_json_path: str,
+    special_tokens_map_path: str,
+    tokenizer_config_path: str,
+    output_model_path: str = "tokenizer.model",
+):
+    with open(tokenizer_json_path, "r", encoding="utf-8") as f:
+        tokenizer_json = json.load(f)
+    with open(special_tokens_map_path, "r", encoding="utf-8") as f:
+        special_tokens_map = json.load(f)
+    with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+        tokenizer_config = json.load(f)
+
+    vocab = tokenizer_json["model"]["vocab"]
+    scores = tokenizer_json["model"].get("scores", [])
+    if len(scores) < len(vocab):
+        scores.extend([0.0] * (len(vocab) - len(scores)))
+    elif len(scores) > len(vocab):
+        scores = scores[:len(vocab)]
+
+    tokenizer_type = tokenizer_json["model"]["type"].lower()
+
+    model = spm.SentencePieceModel()
+
+    for token, score in zip(vocab, scores):
+        piece = model.pieces.add()
+        piece.piece = token
+        piece.score = float(score)
+        piece.type = 1
+
+    unk_id = tokenizer_config.get("unk_token")
+    bos_id = tokenizer_config.get("bos_token")
+    eos_id = tokenizer_config.get("eos_token")
+    pad_id = tokenizer_config.get("pad_token")
+
+    if unk_id is not None:
+      if isinstance(unk_id, dict):
+          unk_id_value = tokenizer_json["model"]["vocab"].get(unk_id["content"])
+      else:
+        unk_id_value = tokenizer_json["model"]["vocab"].get(unk_id)
+
+      if unk_id_value is not None:
+        model.unk_id = unk_id_value
+        model.pieces[unk_id_value].type = 0
+      else:
+        logging.warning(f"unk_id {unk_id} not found")
+
+    if bos_id is not None:
+      if isinstance(bos_id, dict):
+        bos_id_value = tokenizer_json["model"]["vocab"].get(bos_id["content"])
+      else:
+        bos_id_value = tokenizer_json["model"]["vocab"].get(bos_id)
+
+      if bos_id_value is not None:
+        model.bos_id = bos_id_value
+        model.pieces[bos_id_value].type = 1
+      else:
+        logging.warning(f"bos_id {bos_id} not found")
+
+    if eos_id is not None:
+      if isinstance(eos_id, dict):
+        eos_id_value = tokenizer_json["model"]["vocab"].get(eos_id["content"])
+      else:
+        eos_id_value = tokenizer_json["model"]["vocab"].get(eos_id)
+
+      if eos_id_value is not None:
+        model.eos_id = eos_id_value
+        model.pieces[eos_id_value].type = 2
+      else:
+        logging.warning(f"eos_id {eos_id} not found")
+
+    if pad_id is not None:
+      if isinstance(pad_id, dict):
+        pad_id_value = tokenizer_json["model"]["vocab"].get(pad_id["content"])
+      else:
+        pad_id_value = tokenizer_json["model"]["vocab"].get(pad_id)
+      if pad_id_value is not None:
+            model.pieces[pad_id_value].type = 3
+
+    for token_name, token_info in special_tokens_map.items():
+        token_content = token_info["content"]
+        if token_content in vocab:
+            token_id = vocab[token_content]
+            model.pieces[token_id].type = 2 #control
+
+    if "merges" in tokenizer_json["model"] and tokenizer_type == "bpe":
+        merges = tokenizer_json["model"]["merges"]
+
+        def process_merge(merge_str: str) -> Optional[str]:
+          parts = merge_str.split(" ")
+          if len(parts) != 2:
+            return None
+
+          new_parts = []
+          for part in parts:
+            if part.startswith("<0x") and part.endswith(">"):
+                try:
+                    byte_value = int(part[4:-1], 16)
+                    new_parts.append(chr(byte_value))
+                except ValueError:
+                    return None
+            else:
+              new_parts.append(part.replace("Ġ", " "))
+          return " ".join(new_parts)
+
+        for merge in merges:
+          processed_merge = process_merge(merge)
+          if processed_merge:
+            model.pieces.add(piece=processed_merge, score=0.0, type=6) #type 6 for merges
+    else:
+        logging.warning(
+            "No merges found in tokenizer.json, or tokenizer type is not BPE. "
+            "The recreated tokenizer.model will only work at the character/byte level."
+        )
+        if tokenizer_type != "bpe":
+            pass
+        else:
+          for i in range(256):
+            for j in range(256):
+              model.pieces.add(piece = chr(i) + " " + chr(j), score = 0.0, type = 6)
+
+    with open(output_model_path, "wb") as f:
+        f.write(model.SerializeToString())
+
+    print(f"tokenizer.model created at {output_model_path}")
+
 def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)  # Create the temporary directory
 
     try:
         with open(gguf_path, "rb") as f:
@@ -199,36 +329,53 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
             for _ in range(tensor_count):
                 tensor_infos.append(read_tensor_info(f))
 
-            tensors_dict: Dict[str, torch.Tensor] = {}
+            # No longer store tensors in a dictionary directly
+            tensor_files = {}
+
             for name, dims, tensor_type, offset in tensor_infos:
                 logging.info(f"Processing tensor: {name}, offset: {offset}, dims: {dims}")
                 f.seek(offset)
                 block_size, type_size = GGML_QUANT_SIZES[tensor_type]
                 num_elements = np.prod(dims)
 
-                if tensor_type in (0,1):
-                  size_in_bytes = num_elements * type_size
+                if tensor_type in (0, 1):
+                    size_in_bytes = num_elements * type_size
                 else:
-                  size_in_bytes = (num_elements // block_size) * type_size
+                    size_in_bytes = (num_elements // block_size) * type_size
                 logging.info(f"Tensor {name}, Size in bytes: {size_in_bytes}")
 
                 tensor_data = read_bytes(f, size_in_bytes)
                 dequantized_data = dequantize_tensor_data(tensor_data, tensor_type)
                 dequantized_data = dequantized_data.reshape(dims)
-                weights_tensor = torch.from_numpy(dequantized_data).to(dtype=torch.float16)
-                tensors_dict[name] = weights_tensor
+
+                # Write tensor data to a temporary file
+                with tempfile.NamedTemporaryFile(dir=TEMP_DIR, delete=False) as temp_file:
+                    torch.save(torch.from_numpy(dequantized_data).to(dtype=torch.float16), temp_file) #save it to temp first
+                    tensor_files[name] = temp_file.name  # Store the file path
+
+
+        # Now, build the SafeTensors dictionary by loading from the temporary files
+        tensors_dict = {}
+        for name, filepath in tensor_files.items():
+            tensors_dict[name] = torch.load(filepath)  # Load tensor
+            os.remove(filepath)  # And delete the temporary file
+
+        safetensors_path = os.path.join(output_dir, "model.safetensor")
+        try:
+            save_file(tensors_dict, safetensors_path)
+            logging.info(f"SafeTensors file saved to: {safetensors_path}")
+        except Exception as e:
+            logging.error(f"Failed to save SafeTensors file: {e}")
+            return
+        # Clean up any remaining temporary files (shouldn't be any, but just in case)
+        for name, filepath in tensor_files.items():
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
     except Exception as e:
         logging.error(f"Error during GGUF parsing: {e}")
         return
 
-    safetensors_path = os.path.join(output_dir, "model.safetensor")
-    try:
-        save_file(tensors_dict, safetensors_path)
-        logging.info(f"SafeTensors file saved to: {safetensors_path}")
-    except Exception as e:
-        logging.error(f"Failed to save SafeTensors file: {e}")
-        return
 
     config_path = os.path.join(output_dir, "config.json")
     try:
@@ -303,11 +450,59 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
         if isinstance(tokenizer_model_gguf, bytes):
             tokenizer_model_gguf = tokenizer_model_gguf.decode("utf-8", errors="replace")
 
-        # Get tokenizer_type here, OUTSIDE of the try...except blocks
         tokenizer_type = metadata.get("tokenizer.ggml.model", "BPE")
         if isinstance(tokenizer_type, bytes):
             tokenizer_type = tokenizer_type.decode("utf-8", errors="replace")
 
+        # --- special_tokens_map.json ---
+        try:
+            special_tokens_map = {}
+            tokens: List[str] = metadata.get("tokenizer.ggml.tokens", [])
+            if isinstance(tokens, list):
+                tokens = [t.decode("utf-8", errors="replace") if isinstance(t, bytes) else t for t in tokens]
+            else:
+                tokens = []
+                logging.warning("tokenizer.ggml.tokens did not return a list.")
+
+            special_token_ids = {}
+            for key, value in metadata.items():
+                if "tokenizer.ggml" in key and "token_id" in key:
+                    token_name = key.replace("tokenizer.ggml.", "").replace("_token_id", "")
+                    if isinstance(value, int) and 0 <= value < len(tokens):
+                        special_token_ids[token_name] = value
+
+            for token_name, token_id in special_token_ids.items():
+                if token_id < len(tokens):
+                    token_info = {
+                        "content": tokens[token_id],
+                        "lstrip": False,
+                        "normalized": False,
+                        "rstrip": False,
+                        "single_word": False,
+                    }
+                    token_types = metadata.get("tokenizer.ggml.token_type")
+                    if isinstance(token_types, list) and len(token_types) == len(tokens) and tokenizer_type.lower() == "llama":
+                        type_map = {
+                            1: "Unknown",
+                            2: "Control",
+                            3: "UserDefined",
+                            6: "Byte",
+                        }
+                        if token_types[token_id] in type_map:
+                            if type_map[token_types[token_id]] == "UserDefined":
+                                token_info["normalized"] = False
+                            elif type_map[token_types[token_id]] == "Byte":
+                                token_info["normalized"] = False
+
+                    special_tokens_map[token_name + "_token"] = token_info
+
+            with open(special_tokens_map_path, "w") as f:
+                json.dump(special_tokens_map, f, indent=2)
+            logging.info(f"special_tokens_map.json saved to: {special_tokens_map_path}")
+
+        except Exception as e:
+            logging.error(f"Failed to create special_tokens_map.json: {e}")
+            return
         # --- tokenizer_config.json ---
         try:
             tokens = metadata.get("tokenizer.ggml.tokens", [])
@@ -316,6 +511,7 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
             else:
                 tokens = []
                 logging.warning("tokenizer.ggml.tokens did not return a list.")
+
 
             tokenizer_config = {
               "tokenizer_class": arch.capitalize() + "Tokenizer" if tokenizer_model_gguf == "unknown" else tokenizer_model_gguf.capitalize() + "Tokenizer",
@@ -328,19 +524,9 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
             if "tokenizer.ggml.add_eos_token" in metadata:
                 tokenizer_config["add_eos_token"] = metadata["tokenizer.ggml.add_eos_token"]
 
-            special_token_ids = {}
-            for key, value in metadata.items():
-                if "tokenizer.ggml" in key and "token_id" in key:
-                    token_name = key.replace("tokenizer.ggml.", "").replace("_token_id", "")
-                    if isinstance(value, int) and 0 <= value < len(tokens):
-                        special_token_ids[token_name] = value
-
-            for token_name, token_id in special_token_ids.items():
-                if token_name == "unknown":
-                    continue
-                token_str = tokens[token_id]
-                config_key = token_name + "_token"
-                tokenizer_config[config_key] = token_str
+            for key in ["bos_token", "eos_token", "unk_token", "pad_token"]:
+                if key in special_tokens_map:
+                    tokenizer_config[key] = special_tokens_map[key]["content"]
 
             if tokens:
                 added_tokens_decoder = {}
@@ -353,7 +539,7 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
                         "single_word": False,
                         "special": False,
                     }
-                    # Consolidated special token checks
+
                     if any(metadata.get(f"tokenizer.ggml.{name}_token_id") == i for name in ["bos", "eos", "unknown", "padding"]):
                         token_info["special"] = True
                     for key, value in metadata.items():
@@ -363,7 +549,6 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
                             token_info["special"] = True
                             break
 
-                    # LLaMA-specific token type handling
                     token_types = metadata.get("tokenizer.ggml.token_type")
                     if isinstance(token_types, list) and len(token_types) == len(tokens) and tokenizer_type.lower() == "llama":
                         type_map = {
@@ -389,29 +574,6 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
 
         except Exception as e:
             logging.error(f"Failed to create tokenizer_config.json: {e}")
-            return
-
-        # --- special_tokens_map.json ---
-        try:
-            special_tokens_map = {}
-            tokens: List[str] = metadata.get("tokenizer.ggml.tokens", [])
-            if isinstance(tokens, list):
-                tokens = [t.decode("utf-8", errors="replace") if isinstance(t, bytes) else t for t in tokens]
-            else:
-                tokens = []
-                logging.warning("tokenizer.ggml.tokens did not return a list.")
-
-            # Use the special_token_ids dictionary for consistency
-            for token_name, token_id in special_token_ids.items():
-                if token_id < len(tokens):  # Ensure valid index
-                    special_tokens_map[token_name + "_token"] = tokens[token_id] #bos -> bos_token
-
-            with open(special_tokens_map_path, "w") as f:
-                json.dump(special_tokens_map, f, indent=2)
-            logging.info(f"special_tokens_map.json saved to: {special_tokens_map_path}")
-
-        except Exception as e:
-            logging.error(f"Failed to create special_tokens_map.json: {e}")
             return
 
         # --- tokenizer.json ---
@@ -453,17 +615,14 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
                         "special": False,
                     }
 
-                    # Consolidated special token check
                     if any(metadata.get(f"tokenizer.ggml.{name}_token_id") == i for name in ["bos", "eos", "unknown", "padding"]):
                         token_info["special"] = True
-
                     for key, value in metadata.items():
-                        if "tokenizer.ggml" not in key:
-                            continue
-                        if "token_id" in key and value == i:
+                      if "tokenizer.ggml" not in key:
+                        continue
+                      if "token_id" in key and value == i:
                             token_info["special"] = True
                             break
-
 
                     added_tokens_list.append(token_info)
                 tokenizer_json_content["added_tokens"] = added_tokens_list
@@ -481,7 +640,7 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
                             6: "Byte",
                         }
 
-                        added_tokens_list = []  # Rebuild for LLaMA-specific handling
+                        added_tokens_list = []
                         for i, token_type in enumerate(token_types):
                             token_info = {
                                 "id": i,
@@ -500,20 +659,26 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
                                 elif type_map[token_type] == "Byte":
                                     token_info["normalized"] = False
 
-                            # Consolidated special token check (AFTER type handling)
                             if any(metadata.get(f"tokenizer.ggml.{name}_token_id") == i for name in ["bos", "eos", "unknown", "padding"]):
                                 token_info["special"] = True
 
                             for key, value in metadata.items():
-                                if "tokenizer.ggml" not in key:
-                                  continue
-                                if "token_id" in key and value == i:
+                              if "tokenizer.ggml" not in key:
+                                continue
+                              if "token_id" in key and value == i:
                                     token_info["special"] = True
                                     break
 
                             added_tokens_list.append(token_info)
                         tokenizer_json_content["added_tokens"] = added_tokens_list
-
+                if "tokenizer.ggml.merges" in metadata:
+                    merges = metadata.get("tokenizer.ggml.merges")
+                    if isinstance(merges, list):
+                         tokenizer_json_content["model"]["merges"] = [
+                            m.decode("utf-8", errors="replace") if isinstance(m, bytes) else m for m in merges
+                        ]
+                    else:
+                        logging.warning("tokenizer.ggml.merges is not a list")
 
                 with open(tokenizer_json_path, "w") as f:
                     json.dump(tokenizer_json_content, f, indent=2)
@@ -528,19 +693,37 @@ def convert_gguf_to_safetensors(gguf_path: str, output_dir: str) -> None:
             logging.error(f"Failed to create tokenizer.json: {e}")
             return
 
-        # --- tokenizer.model ---
+        # --- tokenizer.model (Recreation) ---
         try:
+          create_tokenizer_model_from_json(
+                tokenizer_json_path,
+                special_tokens_map_path,
+                tokenizer_config_path,
+                tokenizer_model_path
+            )
+          # --- Self-Test of tokenizer.model ---
+          print("Testing tokenizer.model...")
+          sp = spm.SentencePieceProcessor()
+          sp.load(tokenizer_model_path)
 
-            if tokenizer_type.lower() == "llama":
-                with open(tokenizer_model_path, "w") as f:
-                    f.write("Placeholder for LLaMA tokenizer.  This is NOT a real tokenizer model.\n")
-            else:
-                with open(tokenizer_model_path, "wb") as f:
-                    pass
-            logging.info(f"tokenizer.model (placeholder) saved to: {tokenizer_model_path}")
+          print(f"bos id: {sp.bos_id()}")
+          print(f"eos id: {sp.eos_id()}")
+          print(f"unk id: {sp.unk_id()}")
+          print(f"pad id: {sp.pad_id()}")
+
+          test_sentences = [
+              "This is a test sentence.",
+              "Another test.",
+              "<s> This should have special tokens. </s>",
+              "Out-of-vocab-word",
+          ]
+          for sentence in test_sentences:
+              print(f"Original: {sentence}")
+              print(f"  Pieces: {sp.encode_as_pieces(sentence)}")
+              print(f"  IDs: {sp.encode_as_ids(sentence)}")
         except Exception as e:
-            logging.error(f"Failed to create placeholder tokenizer.model: {e}")
-            return
+          logging.error(f"Failed to create tokenizer.model {e}")
+          return
 
     except Exception as e:
         logging.error(f"Tokenizer Files Exception: {e}")
