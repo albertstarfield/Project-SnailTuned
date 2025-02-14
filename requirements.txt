@@ -4,3 +4,4 @@ gguf
 llama-cpp-python
 transformers
 sentencepiece
+protobuf
